@@ -41,8 +41,16 @@ int main(int argc , char *argv[])
          
     server.sin_addr.s_addr = inet_addr("173.194.127.82");
     server.sin_family = AF_INET;
-    server.sin_port = htons( 80 );
- 	
+    server.sin_port = htons( 8888 );
+
+    //Bind socket to a port
+
+    //Bind
+    if( bind(socket_desc,(struct sockaddr *)&server , sizeof(server)) < 0){
+        puts("bind failed");
+    }
+    puts("bind done"); 	
+    
     //Connect to remote server
     if (connect(socket_desc , (struct sockaddr *)&server , sizeof(server)) < 0)
     {

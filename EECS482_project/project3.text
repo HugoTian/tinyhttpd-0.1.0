@@ -1,0 +1,1049 @@
+			Project 3--EECS 482 (Winter 2006)
+
+				Worth: 18 points
+		    Assigned: Friday, March 17, 2006
+		    Due: 6:00 pm, Tuesday, April 18, 2006
+
+1 Overview
+
+In this project, you will implement a multi-threaded, secure network file
+server.  Clients processes that use your file server will interact with it via
+network messages.  This project will help you understand file systems, socket
+programming, client-server systems, and security protocols.
+
+2 Client interface to the file server
+
+Clients of the file server will link with libfs_client.a (provided).
+libfs_client.a includes five functions that a client uses to issue requests to
+your file server: fs_session, fs_read, fs_append, fs_create, fs_delete.
+Clients should include the following header file fs_client.h (provided), which
+describes these functions.
+
+-------------------------------------------------------------------------------
+/*
+ * fs_client.h
+ *
+ * Header file for clients of the file server.
+ */
+
+#ifndef _FS_CLIENT_H_
+#define _FS_CLIENT_H_
+
+#include <sys/types.h>
+#include <netinet/in.h>
+
+#include "fs_param.h"
+
+/*
+ * Ask the file server for a new session.  The location of the file server is
+ * specified by (hostname, port).  The new session is returned in *session_ptr.
+ *
+ * fs_session returns 0 on success, -1 on failure.  Possible failures are:
+ *     bad username or password
+ *
+ * fs_session is NOT thread safe.  Multi-threaded clients must ensure that
+ * only one thread is calling fs_session at a time.
+ */
+extern int fs_session(char *username, char *password, char *hostname,
+                      uint16_t port, int *session_ptr);
+
+/*
+ * Read a portion of the file "filename".  "offset" specifies the starting
+ * byte of the portion to be read; "size" specifies the number of bytes to
+ * read from the file.  "buf" gives a pointer in the client's address space
+ * where the read data should be stored.
+ *
+ * fs_read returns 0 on success, -1 on failure.  Possible failures are:
+ *     filename is not owned by username
+ *     filename does not exist
+ *     there are not enough bytes in filename to satisfy the request
+ *     the offset is invalid
+ *     the size is invalid (e.g. <= 0)
+ *     invalid session or sequence
+ *     bad username or password
+ *
+ * fs_read is thread safe.
+ */
+extern int fs_read(char *username, char *password, int session, int sequence,
+                   char *filename, int offset, void *buf, int size);
+
+/*
+ * Append data to an existing file "filename".  The data to be appended
+ * starts at "buf" and is "size" bytes long.
+ *
+ * fs_append returns 0 on success, -1 on failure.  Possible failures are:
+ *     filename is not owned by username
+ *     filename does not exist
+ *     the size is invalid (e.g. <= 0)
+ *     the disk (or filename) is out of space
+ *     invalid session or sequence
+ *     bad username or password
+ *
+ * fs_append is thread safe.
+ */
+extern int fs_append(char *username, char *password, int session, int sequence,
+                     char *filename, const void *buf, int size);
+
+/*
+ * Create a new file "filename".
+ *
+ * fs_create returns 0 on success, -1 on failure.  Possible failures are:
+ *     filename already exists
+ *     filename too long
+ *     the directory or disk is out of space
+ *     invalid session or sequence
+ *     bad username or password
+ *
+ * fs_create is thread safe.
+ */
+extern int fs_create(char *username, char *password, int session, int sequence,
+                     char *filename);
+
+/*
+ * Delete the existing file "filename".
+ *
+ * fs_delete returns 0 on success, -1 on failure.  Possible failures are:
+ *     filename is not owned by username
+ *     filename doesn't exist
+ *     invalid session or sequence
+ *     bad username or password
+ *
+ * fs_delete is thread safe.
+ */
+extern int fs_delete(char *username, char *password, int session, int sequence,
+                     char *filename);
+#endif /* _FS_CLIENT_H_ */
+-------------------------------------------------------------------------------
+
+Here is an example client that uses these functions.  This client is run with
+two arguments: (1) the name of the file server's computer, (2) the port on
+which the file server process is accepting connections from clients.  Assume
+the file server was initialized with a user "user1" with password "password1").
+
+-------------------------------------------------------------------------------
+#include <iostream>
+#include <cstdlib>
+#include "fs_client.h"
+
+using namespace std;
+
+main(int argc, char *argv[])
+
+{
+    char *server;
+    int server_port;
+    int session, seq=0;
+    char buf[10];
+
+    if (argc != 3) {
+	cout << "error: usage: " << argv[0] << " <server> <serverPort>\n";
+	exit(1);
+    }
+    server = argv[1];
+    server_port = atoi(argv[2]);
+
+    fs_session("user1", "password1", server, server_port, &session);
+    fs_create("user1", "password1", session, seq++, "tmp");
+    fs_append("user1", "password1", session, seq++, "tmp", "abc", 3);
+    fs_read("user1", "password1", session, seq++, "tmp", 1, buf, 2);
+    fs_delete("user1", "password1", session, seq++, "tmp");
+}
+-------------------------------------------------------------------------------
+
+
+3 Communication protocol between client and file server
+
+This section describes the network protocol used to communicate between clients
+and the file server.  The client's side of this protocol is carried out by the
+functions in libfs_client.a.  You will write code in your file server to carry
+out the file server's side of the protocol.
+
+There are five types of requests that can be sent over the network from a
+client to the file server: FS_SESSION, FS_READ, FS_APPEND, FS_CREATE,
+FS_DELETE.  Each client request causes the client library to open a connection
+to the server, send the request, wait for the response, then close the
+connection.
+
+Section 3.1-3.5 describe the format of each client request message
+and the server's response message.  Note the exact spacing in the message
+formats; these must be *exactly* as specified.  The quotes ("...") are not
+part of the message; they are only there for clarity.
+
+If the file server encounters a client request that causes an error, it should
+close the connection (without sending a response message) and continue
+processing other requests.
+
+3.1 FS_SESSION
+
+A client requests a new session with FS_SESSION (a user can call FS_SESSION any
+number of times).  Other types of client requests use a session and sequence
+number as a unique identifiery for the request (a nonce) to thwart replay
+attacks.  A user may only use session numbers that have been returned by that
+user's prior FS_SESSION requests.  A session remains active for the lifetime of
+the file server.
+
+The first request in a session (i.e., the first request after the FS_SESSION
+that created the session) should have a sequence number of at least 0.  Each
+subsequent sequence number for a session must be larger than all prior sequence
+numbers used by that session (they do not have to increase by 1, however).  A
+sequence number for a session gets "used" by any client request in that
+session, as long as the client request is made by the user that created that
+session.  Erroneous requests use up sequence numbers just like correct requests
+(think about what attack could be executed otherwise), as long as the file
+server can decrypt and parse the session/sequence numbers from the request.
+
+An FS_SESSION request message is a string of the following format:
+
+    "FS_SESSION <username> <session> <sequence><NULL>"
+
+    <username> is the name of the user making the request
+    <session> and <sequence> are each 0 (they exist here simply to make the
+        formats of different requests more uniform)
+    <NULL> is the ascii character '\0' (terminating the string)
+
+Upon receiving an FS_SESSION request, the file server should assign the
+*lowest-numbered* unused session (the first returned session number should be
+0) and send the following response message:
+
+    "<session> <sequence><NULL>"
+
+    <session> is the new session number
+    <sequence> should be 0
+    <NULL> is the ascii character '\0' (terminating the string)
+
+3.2 FS_READ
+
+A client reads an existing file by sending an FS_READ request to the file
+server.
+
+An FS_READ request message is a string of the following format:
+
+    "FS_READ <username> <session> <sequence> <filename> <offset> <size><NULL>"
+
+    <username> is the name of the user making the request
+    <session> is the session number for this request
+    <sequence> is the sequence number for this request
+    <filename> is the name of the file being read
+    <offset> specifies the starting byte of the file portion being read
+    <size> specifies the number of bytes to read from the file
+    <NULL> is the ascii character '\0' (terminating the string)
+
+Upon receiving an FS_READ request, the file server should check the validity
+of its parameters.  The server should also check that the file exists, is
+owned by <username>, and is large enough to satisfy the request.  If the
+request is allowed, the file server should read the requested data from disk
+(in the order the bytes appear in the file) and return the data in the
+response message.  The response message for a successful FS_READ follows the
+following format:
+
+    "<session> <sequence><NULL>"<data>
+
+    <session> is the session number from the request message
+    <sequence> is the sequence from the request message
+    <NULL> is the ascii character '\0' (terminating the string)
+    <data> is the data that was read from the file.  Note that <data> is
+        outside of the response string (i.e. after <NULL>).  The size of
+        <data> should be the <size> from the request message.
+
+3.3 FS_APPEND
+
+A client appends to an existing file by sending an FS_APPEND request to the
+file server.
+
+An FS_APPEND request message is a string of the following format:
+
+    "FS_APPEND <username> <session> <sequence> <filename> <size><NULL>"<data>
+
+    <username> is the name of the user making the request
+    <session> is the session number for this request
+    <sequence> is the sequence number for this request
+    <filename> is the name of the file to which the data is being appended
+    <size> specifies the number of bytes to append to the file
+    <NULL> is the ascii character '\0' (terminating the string)
+    <data> is that data to append to the file.  Note that <data> is outside of
+        the request string (i.e. after <NULL>).  The size of <data> is given
+	in <size>.
+
+Upon receiving an FS_APPEND request, the file server should check the validity
+of its parameters.  The server should also check that the file exists, is
+owned by <username>, and that there is sufficient disk space to satisfy the
+request.
+
+If the request is allowed, the file server should append the data to the file
+(writing to disk in the order the bytes appear in the file).  The response
+message for a successful FS_APPEND follows the following format:
+
+    "<session> <sequence><NULL>"
+
+    <session> is the session number from the request message
+    <sequence> is the sequence from the request message
+    <NULL> is the ascii character '\0' (terminating the string)
+
+No data should be appended to the file for unsuccessful requests.
+
+3.4 FS_CREATE
+
+A client creates a new file by sending an FS_CREATE request to the file server.
+
+An FS_CREATE request message is a string of the following format:
+
+    "FS_CREATE <username> <session> <sequence> <filename><NULL>"
+
+    <username> is the name of the user making the request
+    <session> is the session number for this request
+    <sequence> is the sequence number for this request
+    <filename> is the name of the file being created
+    <NULL> is the ascii character '\0' (terminating the string)
+
+Upon receiving an FS_CREATE request, the file server should check the validity
+of its parameters.  The server should also check that the file does not
+yet exist and that there is sufficient disk space to create a new file.  If
+the request is allowed, the file server should create the new file.  The
+response message for a successful FS_CREATE follows the following format:
+
+    "<session> <sequence><NULL>"
+
+    <session> is the session number from the request message
+    <sequence> is the sequence from the request message
+    <NULL> is the ascii character '\0' (terminating the string)
+
+3.5 FS_DELETE
+
+A client deletes an existing file by sending an FS_DELETE request to the file
+server.
+
+An FS_DELETE request message is a string of the following format:
+
+    "FS_DELETE <username> <session> <sequence> <filename><NULL>"
+
+    <username> is the name of the user making the request
+    <session> is the session number for this request
+    <sequence> is the sequence number for this request
+    <filename> is the name of the file being deleted
+    <NULL> is the ascii character '\0' (terminating the string)
+
+Upon receiving an FS_DELETE request, the file server should check the validity
+of its parameters.  The server should also check that the file exists and
+is owned by <username>.  If the request is allowed, the file server should
+delete the file.  The response message for a successful FS_DELETE follows the
+following format:
+
+    "<session> <sequence><NULL>"
+
+    <session> is the session number from the request message
+    <sequence> is the sequence from the request message
+    <NULL> is the ascii character '\0' (terminating the string)
+
+4 Encryption
+
+All messages between the client and file server will use encryption (secret-key
+encryption based on the user's password).  The file server will be given a list
+of user and passwords when it is started (see Section 6.1).  fs_param.h
+(automatically included in fs_client.h and fs_server.h) defines the maximum
+size of a username and password as FS_MAXUSERNAME and FS_MAXPASSWORD.
+
+We will provide encryption and decryption functions (described in Section 7).
+
+Each of the request messages described in Section 3 will be encrypted using the
+password parameter that was passed to the client function.  To enable the file
+server to decrypt the request message, the client will send a cleartext (i.e.
+un-encrypted) request header before sending the request message.  The cleartext
+request header follows the following format:
+
+    "<username> <size><NULL>"
+
+    <username> is the name of the user that was passed to the client function.
+        The file server uses this information to choose which password to use
+	to decrypt the ensuing request message.
+    <size> is the size of the encrypted message that follows this cleartext
+        request header
+    <NULL> is the ascii character '\0' (terminating the string)
+
+When the file server receives a request, it will first decrypt the request
+using the information provided in the cleartext request header.  There are
+some cases where the file server will not be able to decrypt the request.
+This can happen if <username> is not valid, or if the client uses the wrong
+password.  The file server should handle these cases like other erroneous
+requests (by closing the connection without sending a response).
+
+Each response message from the file server will be encrypted using the user's
+password.  To enable the client to receive and decrypt the response message,
+the file server will send a cleartext response header before sending the
+response message.  The cleartext response header follows the following format:
+
+    "<size><NULL>"
+
+    <size> is the size of the encrypted message that follows this cleartext
+        response header
+    <NULL> is the ascii character '\0' (terminating the string)
+
+5 File system structure on disk
+
+This section describes the file system structure on disk that your file server
+will read and write.  fs_param.h (which is included automatically in both
+fs_client.h and fs_server.h) has the following file system parameters:
+
+-------------------------------------------------------------------------------
+/*
+ * fs_param.h
+ *
+ * File server parameters (used by both clients and server).
+ */
+
+#ifndef _FS_PARAM_H_
+#define _FS_PARAM_H_
+
+/*
+ * File system parameters
+ */
+#define FS_BLOCKSIZE	1024	/* size of a disk block.  The directory and each
+				   inode take exactly 1 disk block. */
+#define FS_DISKSIZE	512	/* size of the disk (in blocks) */
+#define FS_MAXFILENAME	11	/* maximum name of a file, not including null
+                                   terminator */
+#define FS_MAXUSERNAME	7	/* maximum name of a user, not including the
+				   null terminator */
+#define FS_MAXPASSWORD	15	/* maximum password length, not including the
+                                   null terminator */
+#define FS_MAXFILES	64	/* maximum # of files (constrained by the
+                                   size of the directory and the size of each
+				   directory entry) */
+#define FS_MAXFILEBLOCKS  253	/* maximum # of data blocks in a file
+                                   (constrained by the number of entries that
+				   can fit in a one-block inode */
+#endif /* _FS_PARAM_H_ */
+-------------------------------------------------------------------------------
+
+The following portion of fs_server.h (provided) has two typedefs that describe
+the on-disk data structures:
+-------------------------------------------------------------------------------
+/*
+ * Typedefs for on-disk data structures.
+ */
+typedef struct {
+    char name[FS_MAXFILENAME + 1];	/* name of this file */
+    int inode_block;			/* disk block that stores the inode for
+    					   this file */
+} fs_direntry;
+
+typedef struct {
+    char owner[FS_MAXUSERNAME + 1];
+    int size;				/* size of the file in bytes */
+    int blocks[FS_MAXFILEBLOCKS];	/* array of data blocks for this file */
+} fs_inode;
+-------------------------------------------------------------------------------
+
+The file system consists of a single directory of files.  The directory is
+stored in disk block 0 and consists of an array of fs_direntry entries (one
+entry per file).  Unused directory entries have inode_block=0.  There are at
+most FS_MAXFILES in the directory.  In the array of directory entries, there
+may be entries that are used interspersed with entries that are unused, e.g.
+entries 0, 5, and 15 might be used, with the rest of the entries being unused.
+Each directory entry contains the file name (a string of characters, including
+the '\0' that terminates the string) and the disk block number that stores that
+file's inode.
+
+Each file in the file system is described in an inode.  Each inode is stored in
+a single disk block.  The structure of an inode is specified in fs_inode.  The
+owner in the inode structure is the name of the user that created the file (a
+string of characters, including the '\0' that terminates the string).  The
+"blocks" array lists the disk blocks where this file's data is stored.  Entries
+in the "blocks" array that are beyond the end of the file may have arbitrary
+values.
+
+6 File server internals
+
+This section discusses and guides some design choices you will encounter when
+writing the file server.  Your file server should include the header file
+fs_server.h.
+
+6.1 Arguments and input
+
+Your file server should be able to be called with 0 or 1 command-line
+arguments.  The argument, if present, specifies the port number the file server
+should use to listen for incoming connections from clients.  If there is no
+argument, the file server should have the system choose a port.
+
+Your file server will be passed a list of usernames and passwords via stdin
+(the file stream read by cin).  Each line will contain "<username> <password>".
+For example, the Linux file "passwords" could contain the following contents:
+
+user1 password1
+user2 password2
+user3 password3
+user4 password4
+
+and your file server could be started as: "fs 8000 < passwords" or
+"fs < passwords".  You may assume that usernames and passwords in this file
+are of legal length, and contain only letters and numbers.
+
+6.2 Initialization
+
+When your file server starts, it should first read the list of usernames and
+passwords from stdin.  Next, it should set up the socket that clients will use
+to connect to the file server, including calling listen() (Section 9).
+
+After calling listen, your file server should print the port number of the
+socket that clients will use to connect to the file server (regardless of
+whether it was specified on the command line or chosen by the system).  Here's
+the statement to use (substitute "port_number" with your own variable):
+
+    cout << "\n@@@ port " << port_number << endl;
+
+Next, your file server should read the directory block from disk into memory,
+then read the inodes for all valid directory entries in order of their entry in
+the directory (i.e.  start by reading the inode for directory entry 0, then
+read the inode for entry 1, etc.).  Your file server uses this scan of all
+inodes to initialize the list of free disk blocks.  Your file server should be
+able to start with any valid file system (empty or with files).
+
+After all these aspects of initialization are complete, your file server should
+start accepting connections from clients and servicing their requests.
+
+6.3 Concurrency
+
+The workload to your file server may include any number of concurrent client
+requests.  Your file server should be multi-threaded, so that it can service
+requests from *any* number of clients at the same time.
+
+One goal of this project is to avoid blocking concurrent client requests.
+Except as described below, a thread A that is servicing one client request
+should not block threads that are servicing other client requests while thread
+A is doing a blocking system call, viz. receiving data from the network and
+reading or writing the disk.  You can think of the disk (described in Section
+7) as a disk array that supports concurrent accesses.
+
+In particular, the following file system operations should be allowed to
+proceed in parallel:
+
+    a. FS_SESSION with all other requests
+
+    b. multiple FS_READ's of the same file
+
+    c. FS_READ or FS_APPEND of one file, with FS_READ or FS_APPEND of a
+        different file.
+
+Other combinations of file system operations should NOT proceed in parallel:
+
+    a. FS_APPEND of a file with FS_READ or FS_APPEND of the same file.  This
+        combination cannot proceed safely in parallel because FS_APPEND
+        modifies the file.
+
+    b. FS_CREATE or FS_DELETE of any file with FS_READ, FS_APPEND, FS_CREATE,
+	or FS_DELETE of any file (files could be the same or different).  This
+	combination cannot proceed safely in parallel because FS_CREATE and
+	FS_DELETE write the directory.  Do not allow the later request to
+	access the directory until the earlier request completes its disk I/Os.
+
+You should use pthread operations to create a thread for each request and
+synchronize between these threads.  Keep your synchronization scheme as simple
+as possible.
+
+Hint: one good concurrency scheme for this project depends heavily on
+reader-writer locks.  Think about what each file system operation reads
+or writes, and think about using reader-writer locks to protect these
+accesses from conflicting requests.
+
+Writing and debugging your file server will be much easier if you first take
+care to carefully design your synchronization scheme and write out pseudo-code
+for how your file server will handle each type of request.
+
+Warning: the C++ string class is NOT thread safe, and it is difficult to use
+locks to make the C++ string class thread safe (it's hard to put locks around
+implicit calls to the C++ string constructors).  Use C-style strings for this
+project.
+
+6.4 Performance and caching
+
+Your file server should minimize the number of disk I/Os used to carry out
+requests.  Most file servers cache disk information in memory aggressively to
+reduce disk I/Os.  However, to simplify the project, your file server will do
+only very limited caching.  The only information about disk state that your
+file server should cache in memory is a copy of the directory entry and the
+list of free disk blocks.  E.g. your file server will NOT cache file inode
+information or data blocks.
+
+6.5 Allocation of disk blocks and directory entries
+
+When you need to allocate a disk block, always choose the lowest-numbered free
+disk block.  When FS_CREATE needs to allocate a directory entry, it should
+choose the lowest-numbered free directory entry.  When FS_DELETE frees a
+directory entry, that entry should be marked empty by setting its inode_block
+to 0, but other entries should not be changed (i.e. they are not shifted down
+in the directory array).
+
+6.6 File system consistency and order of disk writes
+
+Your file server must maintain a consistent file system on disk, regardless of
+when the system might crash.  This implies a certain ordering of disk writes
+for file system operations that involve multiple disk writes.  The general rule
+for file systems is that meta-data (e.g. directory or inode) should never point
+to anything invalid (e.g. invalid inode block or data block).  Thus, when
+writing a block of data and a block containing a pointer to the data block, one
+should write the block being pointed to before writing the block containing the
+pointer.
+
+E.g. for FS_CREATE, the file server should write the new inode to disk before
+writing the directory block (which points to that inode).  If the file server
+mistakenly wrote out the directory block before the inode block, a crash in
+between these two writes would leave the directory pointing at a garbage inode
+block.  In the same way, you should reason through the order of disk writes for
+FS_APPEND and FS_DELETE so that the file system remains consistent regardless
+of when a crash occurs.
+
+7 Utility functions and utility programs
+
+We will provide a library of utility functions in libfs_server.a that your file
+server must use to encrypt/decrypt data, access disk, and send network
+messages.  The encryption routines fs_encrypt and fs_decrypt are described in
+fs_crypt.h (automatically included in fs_server.h):
+
+-------------------------------------------------------------------------------
+/*
+ * fs_crypt.h
+ *
+ * File server encryption routines.
+ */
+
+#ifndef _FS_CRYPT_H_
+#define _FS_CRYPT_H_
+
+/*
+ * Encrypt a block of data using the null-terminated string "password" as the
+ * encryption key, using AES (Rijndael) encryption.  The block of data to be
+ * encrypted is pointed to by buf_cleartext and is of size size_cleartext.
+ *
+ * fs_encrypt allocates and returns a buffer that contains the
+ * encrypted data.  It also returns the size of the encrypted data in
+ * *size_ciphertext_ptr.  Caller has responsibility to free the allocated
+ * buffer by calling delete [] buf, where buf is the return value from
+ * fs_encrypt.
+ *
+ * fs_encrypt is thread safe.
+ */
+void *fs_encrypt(const char *password, const void *buf_cleartext,
+                 const int size_cleartext, int *size_ciphertext_ptr);
+
+/*
+ * Decrypt a block of data using the null-terminated string "password" as the
+ * decryption key, using AES (Rijndael) decryption.  The block of data to be
+ * decrypted is pointed to by buf_ciphertext and is of size size_ciphertext.
+ *
+ * fs_decrypt allocates and returns a buffer that contains the
+ * decrypted data.  It also returns the size of the decrypted data in
+ * *size_cleartext_ptr.  Caller has responsibility to free the allocated
+ * buffer by calling delete [] buf, where buf is the return value from
+ * fs_decrypt.
+ *
+ * fs_decrypt returns NULL if decryption fails (e.g. due to a password that
+ * doesn't match the one used in encryption).
+ *
+ * fs_decrypt is thread safe.
+ */
+void *fs_decrypt(const char *password, const void *buf_ciphertext,
+                 const int size_ciphertext, int *size_cleartext_ptr);
+
+#endif /* _FS_CRYPT_H_ */
+-------------------------------------------------------------------------------
+
+(FYI, libfs_client.a also includes fs_encrypt and fs_decrypt, but the client's
+use of encryption is taken care of by the provided functions fs_session,
+fs_read, fs_append, fs_create, fs_delete).
+
+fs_encrypt and fs_decrypt can encrypt/decrypt an arbitrary buffer of data.
+Note that the size of the encrypted data will differ from the size of the
+cleartext data, which is why fs_encrypt and fs_decrypt return both a pointer to
+the transformed data, along with the size of that transformed data.  Remember
+to free the memory allocated by fs_encrypt and fs_decrypt after you are done
+using it (free it with code like "delete [] buf").
+
+The provided encryption routines in libfs_server.a and libfs_client.a support
+two types of encryption: CLEAR and AES.  CLEAR encryption encrypts the data
+with a trivial encryption scheme that leaves the data visible; this makes it
+easier to understand and debug network messages.  AES encryption encrypts the
+data with the AES (Rijndael) algorithm.  Both client and server must use the
+same type of encryption.  To specify the type of encryption, set the FS_CRYPT
+environment variable to CLEAR or AES.  In csh or tcsh, you can do this with
+"setenv FS_CRYPT CLEAR" or "setenv FS_CRYPT AES".  In sh or bash, you can do
+this with "export FS_CRYPT=CLEAR" or "export FS_CRYPT=AES".
+
+The functions you will use to access disk, send network messages, and close
+network sockets are included in libfs_server.a and are described in the
+following portion of fs_server.h:
+
+-------------------------------------------------------------------------------
+/*
+ * Logging version of the standard send library call.  fs_send has the same
+ * parameters and return value as the standard send() library call.
+ */
+ssize_t fs_send(int s, const void *msg, size_t len, int flags);
+
+/*
+ * Logging version of the standard close library call.  fs_close has the same
+ * parameters and return value as the standard close() library call.
+ */
+int fs_close(int fildes);
+
+/*
+ * Mutex to prevent garbled output from a multi-threaded file server.
+ * Your file server must wrap each call to cout inside a critical section
+ * protected by cout_lock.
+ */
+extern pthread_mutex_t cout_lock;
+
+/*
+ * Global variable to control debugging output for fs_send and fs_close.
+ */
+extern bool fs_quiet;
+
+/*
+ * Interface to the disk.
+ *
+ * Disk blocks are numbered from 0 to (FS_DISKSIZE-1).
+ * disk_readblock and disk_writeblock are both thread safe, i.e. multiple
+ * threads can safely make simultaneous calls to these functions.
+ */
+
+/*
+ * disk_readblock
+ *
+ * Copies disk block "block" into buf.  Asserts on failure.
+ */
+extern void disk_readblock(int block, void *buf);
+
+/*
+ * disk_writeblock
+ *
+ * Copies buf to disk block "block".  Asserts on failure.
+ */
+extern void disk_writeblock(int block, const void *buf);
+
+/*
+ * Global variable to control debugging output for disk operations.
+ */
+extern bool disk_quiet;
+-------------------------------------------------------------------------------
+
+Your file server will use disk_readblock() and disk_writeblock() to read and
+write a disk block (do only necessary disk I/Os).  These functions access
+the disk data stored in the Linux file "/tmp/fs_tmp.<uniqname>.disk", where
+<uniqname> is the login ID of the person running the file server.  You may use
+the variable disk_quiet to turn on/off debugging output for the disk routines.
+disk_quiet defaults to false (debugging output is on); setting it to true
+disables debugging output.
+
+You can create a newly initialized file system in the Linux file
+"/tmp/fs_tmp.<uniqname>.disk" by using the utility program "createfs"
+(provided).  You can use the utility program "showfs" (provided) to show the
+current file system contents stored in "/tmp/fs_tmp.<uniqname>.disk".
+
+Your file server must use fs_send() to send network messages.  fs_send takes
+the same argument list as the standard send() library call, but it gives a
+convenient way for you to see the data being sent over the network.  Your file
+server must use fs_close() to close network sockets.  fs_close takes the same
+argument list as the standard close() library call, but it gives a convenient
+way for you to see that the file server is done processing a request.
+
+You may use the variable fs_quiet to turn on/off debugging output for fs_send
+and fs_close.  fs_quiet defaults to false (debugging output is on); setting it
+to true disables debugging output.
+
+Each response to a client request must be made using exactly two calls to
+fs_send: the first call to fs_send should send the cleartext response header;
+the second call to fs_send should send the response itself (this second message
+includes the <data> part of an FS_READ response).  Your file server should send
+a response back to the client only after all processing for that request is
+finished.
+
+8 Output
+
+Your file server must produce the output mentioned in Section 6.2, and
+it will also (with appropriate settings for fs_quiet and disk_quiet) produce
+output via calls to disk_readblock, disk_writeblock, and fs_send.  In
+addition, your file server may produce any output you need for debugging,
+as long as that output does not contain lines that start with "@@@".
+
+Because your file server is multi-threaded, you must be careful to prevent
+output from different threads from being interleaved.  To prevent garbled
+output, your file server must wrap each call to cout inside a critical section
+protected by the mutex "cout_lock" (declared in fs_server.h).  This is the
+mutex used by the output generated in libfs_server.a, so you also need to use
+it whenever your file server generates output.
+
+9 Sockets and TCP
+
+A significant part of this project is learning how to use Berkeley sockets,
+which is a common programming interface used in network programming.
+Unfortunately, the socket interface is rather complicated.  This section
+contains a little help for using sockets, but we expect you to get many
+necessary details by reading the relevant man pages.  Start with the tcp
+man page.  The class web page also contains a tutorial on how to use sockets
+and TCP.
+
+Start by using the socket() call to creating a socket, which is an endpoint
+for communication.  The tcp man page tells you how to create a socket for TCP.
+It's usually a good idea (though not strictly necessary) to configure the
+socket to allow it to reuse local addresses.  Use setsockopt() with level
+SOL_SOCKET and optname SO_REUSEADDR to configure the socket.  This avoids the
+annoying "bind: address already in use" error that you would otherwise get
+when you kill the file server and restart it with the same port number.
+
+After creating the socket, the next step is to assign a port number to the
+socket.  This port number is what a client will use to connect to the file
+server.  Use bind() to assign a port number to a socket.  Here's how to
+initialize the parameter passed to bind:
+
+    struct sockaddr_in addr;
+
+    bzero(&addr, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(port_number);
+
+    bind(sock, (struct sockaddr*) &addr, sizeof(addr));
+
+See the ip(7) man page for an explanation of INADDR_ANY.  htonl() and htons()
+are used to convert host integers and shorts into network format (network byte
+order) for use by bind.  If port_number is 0 in the above code, bind will have
+the system select a port.
+
+Use getsockname() to get the port number assigned by the system.  Use ntohs()
+to convert from the network byte order returned by bind to a host number.
+
+After binding, use listen() to configure the socket to allow a queue of
+pending connection requests.  A queue length of 10 should be sufficient.
+
+Use accept() to accept a connection on the socket.  accept creates a new
+socket that can be used for two-way communication between the two parties.  A
+client process will use connect() to initiate a connection to the file server.
+
+Use recv() to receive a network message, and fs_send (in libfs_server.a) to
+send a network message.
+
+Don't forget to close the socket (using fs_close) after you're done servicing
+the request, otherwise you'll quickly run out of free file descriptors.
+
+Some clients may shut down the connection before the file server has sent the
+response.  Sending to a connection that is shut down generates a SIGPIPE
+signal, which would terminate the file server.  To fix this, execute
+    signal(SIGPIPE, SIG_IGN);
+
+After this, fs_send will return an error when sending to a connection that is
+shut down, and your file server can stop sending the response.
+
+10 Pthreads
+
+Your file server will be multi-threaded so it can overlap requests from many
+clients.  The thread library you wrote in Project 1 illustrated many of the
+concepts of threads.  However, making a thread library that can be used for
+real applications requires dealing with many other issues, e.g. preemption
+during blocking system calls.  For this project, you will use the pthread
+library.
+
+There are a LOT of pthread functions; here are some you might find useful for
+this program:
+
+    pthread_create
+    pthread_detach
+    pthread_mutex_init
+    pthread_mutex_lock
+    pthread_mutex_unlock
+    pthread_cond_init
+    pthread_cond_wait
+    pthread_cond_signal
+    pthread_cond_broadcast
+    pthread_rwlock_init
+    pthread_rwlock_rdlock
+    pthread_rwlock_wrlock
+    pthread_rwlock_unlock
+    pthread_attr_init
+    pthread_attr_setstacksize
+
+For the most part, using pthreads is very similar to using your threads in
+Project 1.  See the man pages for details.  Unfortunately, default Linux
+installations are missing the man pages for pthread_rwlock_* and
+pthread_attr_setstacksize; use the Solaris man page for these.
+
+Your file server must execute the following code when creating a thread.  This
+reduces the size of a thread's stack (the default value of 8 MB is too large
+to support highly concurrent workloads) and creates the thread in the
+"detached" state (so that memory used for that thread is reclaimed when the 
+thread finishes).
+
+
+    pthread_attr_t attr;	// use &attr as a parameter to pthread_create
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 1024*1024);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+11 Test cases
+
+An integral (and graded) part of writing your file server will be to write a
+suite of test cases to validate any file server.  This is common practice in
+the real world--software companies maintain a suite of test cases for their
+programs and use this suite to check the program's correctness after a change.
+Writing a comprehensive suite of test cases will deepen your understanding of
+file systems, and it will help you a lot as you debug your file server.  To
+construct a good test suite, think about what different things might happen
+on each type of request (e.g. what effect different offsets and sizes might
+have on the disk I/Os needed to satisfy a request).
+
+Each test case for the file server will be a short C++ client program that uses
+a file server via the interface described in Section 2 (e.g. the example
+program in Section 2).
+
+Each test case should be run with exactly two arguments: the first argument
+being the hostname that is running the file server, the second argument being
+the port that the file server is listening on for client connections.  Test
+cases should not use any other input.
+
+When we run your test cases, we will start the file server with an empty file
+system and the following password file:
+
+user1 password1
+user2 password2
+user3 password3
+user4 password4
+
+We will compile a test case "app.cc" by running:
+    g++ app.cc libfs_client.a
+
+Your test suite may contain up to 20 test cases.  Each test case may cause a
+correct file server to generate at most 1000 lines of "@@@" output and take
+less than 60 seconds to run.  These limits are much larger than needed for
+full credit.  You will submit your suite of test cases together with your file
+server, and we will grade your test suite according to how thoroughly it
+exercises a file server.  See Section 13 for how your test suite will be
+graded.
+
+You should test your file server with both serial and concurrent client
+requests.  However, your submitted test suite need only be a single process
+issuing a single request at a time; none of the buggy file servers used to
+evaluate your test suite require multiple concurrent requests to be exposed.
+
+12 Project logistics
+
+Write your file server in C++ on Linux.  Declare all global variables and
+functions "static" to prevent naming conflicts with other libraries.
+
+Use g++ (/usr/bin/g++) to compile your programs.  You may use any functions
+included in the standard C++ library, including (and especially) the STL.  You
+should not use any libraries other than the standard C++ library.  We will
+compile a file server "fs.cc" with the command
+
+    g++ fs.cc libfs_server.a -pthread
+
+You can compile a client application app.cc with the command
+    g++ app.cc libfs_client.a
+
+Your file server must be in a single file and must be named "fs.cc".
+
+We will place copies of fs_client.h, fs_server.h, fs_param.h, fs_crypt.h,
+libfs_client.a, libfs_server.a, createfs, and showfs in
+/afs/engin.umich.edu/class/perm/eecs482/proj3.  You should make copies of these
+files and store them in your own directory so your client applications can
+include and link with them easily.
+
+13 Grading, auto-grading and formatting
+
+To help you validate your programs, your submissions will be graded
+automatically, and the result will be mailed back to you.  You may then
+continue to work on the project and re-submit.  The results from the
+auto-grader will not be very illuminating; they won't tell you where your
+problem is or give you the test programs.  The main purpose of the auto-grader
+is it helps you know to keep working on your project (rather than thinking it's
+perfect and ending up with a 0).  The best way to debug your program is to
+generate your own test cases, figure out the correct answers, and compare your
+program's output to the correct answers.  This is also one of the best ways to
+learn the concepts in the project.
+
+Hint: here is a (very rough) categorization of some of the test cases used by
+the auto-grader.  Some test cases are too special-purpose to categorize;
+others appear in multiple categories.
+    0-8: basic functionality
+    9-14: error handling
+    15-18: large, serial (i.e. non-concurrent) test cases
+    21-42: start with pre-existing file systems
+    20,22-42: concurrent test cases
+
+The student suite of test cases will be graded according to how thoroughly they
+test a file server.  We will judge thoroughness of the test suite by how well
+it exposes potential bugs in a file server.  The auto-grader will first run a
+test case with a correct file server to generate the right answers for this
+test case.  The auto-grader will then run the test case with a set of buggy
+file servers.  A test case exposes a buggy file server by causing the buggy
+file server to generate output (on stdout) that differs from correct file
+server's output or by causing the buggy file server to generate a file system
+image on disk (i.e. showfs output) that differs from that generated by a
+correct file server.  The test suite is graded based on how many of the buggy
+file servers were exposed by at least one test case.  This is known as
+"mutation testing" in the research literature on automated testing.
+
+You may submit your program as many times as you like.  However, only the first
+submission of each day will be graded and mailed back to you.  Later
+submissions on that day will be graded and cataloged, but the results will not
+be mailed back to you.  See the FAQ for why we use this policy.
+
+In addition to this one-per-day policy, you will be given 3 bonus submissions
+that also provide feedback.  These will be used automatically--any submission
+you make after the first one of that day will use one of your bonus
+submissions.  After your 3 bonus submissions are used up, the system will
+continue to provide 1 feedback per day.
+
+Because your programs will be auto-graded, you must be careful to follow the
+exact rules in the project description:
+
+    1) Your code should not print any debugging output lines that start with
+        "@@@".
+
+    2) Do not modify the header files or libraries provided in the project
+        directory.
+    
+    3) Your file server must use disk_readblock/disk_writeblock to write the
+        disk, fs_send to send messages, and fs_close to close a network
+        socket.  Remember to send each response via two calls to fs_send: one
+        to send the cleartext response header, the second to send the response
+        itself.
+
+    4) When allocating a disk block, always choose the lowest-numbered free
+	disk block.  When FS_CREATE allocates a directory entry, it should
+	choose the lowest-numbered free directory entry.  When FS_DELETE frees
+	a directory entry, it should leave other entries in place.
+
+    5) The file server should send a response back only after all processing
+	for that request is finished.
+
+In addition to the auto-grader's evaluation of your programs' correctness, a
+human grader will evaluate your programs on issues such as the clarity and
+completeness of your documentation, coding style, the efficiency, brevity, and
+understandability of your code, etc..  Your documentation should explain the
+synchronization scheme followed by your file server.  Your final score for
+each project part will be the product of the hand-graded score (between
+1-1.04) and the auto-grader score.
+
+14 Turning in the project
+
+Use the submit482 program to submit your files.  The full name is
+/afs/engin.umich.edu/class/perm/eecs482/bin/submit482, but you should add
+/afs/engin.umich.edu/class/perm/eecs482/bin/ to your path (see the FAQ) so you
+don't have to keep typing in the full name.  submit482 submits the set of files
+associated with a project part, and is called as follows:
+
+    submit482 <project-part> <file1> <file2> <file3> ... <filen>
+
+Here are the files you should submit for each project part:
+    1) file server (project-part 3)
+        a. C++ program for your file server (name should be "fs.cc")
+	b. suite of test cases (each test case is a C++ program in a
+	    separate file).
+
+	example:
+	    submit482 3 fs.cc test1.cc test2.cc
+
+The official time of submission for your project will be the time of your last
+submission.  If you send in anything after the due date, your project will be
+considered late (and will use up your late days or will receive a zero).
+
+Each group member will evaluate the contributions made by each person in the
+group.  The course home page will have a link to a web form where you can
+enter your evaluation.

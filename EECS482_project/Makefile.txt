@@ -1,0 +1,15 @@
+all: client server
+
+client:client.o 
+	g++ -o client client.o 
+
+client.o:client.cc
+	g++ -c client.cc
+
+server:server.o
+	g++ -o server server.o
+server.o:server.cc 
+	g++ -c server.cc
+
+clean:
+	rm *.o server client
